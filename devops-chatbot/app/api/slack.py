@@ -5,9 +5,8 @@ import logging
 from app.core.config import settings
 from app.core.security import verify_slack_signature
 from app.services.monitor import get_system_stats, check_service_status
-from app.services.deploy import deploy_application, get_deployment_status
 from app.services.heal import restart_failed_services, clean_disk_space
-
+from app.services.deploy import deploy_application, get_application_status
 logger = logging.getLogger(__name__)
 router = APIRouter()
 client = AsyncWebClient(token=settings.SLACK_BOT_TOKEN)
