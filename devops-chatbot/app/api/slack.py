@@ -4,122 +4,152 @@ import json
 import logging
 from app.core.config import settings
 from app.core.security import verify_slack_signature
-from app.services.monitor import get_system_stats, check_service_status
-from app.services.heal import restart_failed_services, clean_disk_space
-from app.services.deploy import deploy_application, get_application_status
+from app.services.monitor import get_system_stats, format_system_stats_for_slack
+from app.services.deploy import deploy_application, format_deployment_result_for_slack
+from app.services.heal import run_healing_tasks, format_healing_results_for_slack
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 client = AsyncWebClient(token=settings.SLACK_BOT_TOKEN)
 
 @router.post("/events")
 async def slack_events(request: Request):
-    """Handle Slack events"""
-    body = await request.body()
-    verify_slack_signature(request, body)
-    
-    payload = json.loads(body)
-    
-    # URL verification challenge
-    if payload.get("type") == "url_verification":
-        return {"challenge": payload["challenge"]}
-    
-    # Handle events
-    event = payload.get("event", {})
-    if event.get("type") == "app_mention":
-        await handle_mention(event)
-    
-    return {"status": "ok"}
+    """Handle Slack events including URL verification"""
+    try:
+        body = await request.body()
+        
+        # Parse JSON payload
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON in Slack request")
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+        
+        # Handle URL verification challenge (required for Event Subscriptions)
+        if payload.get("type") == "url_verification":
+            challenge = payload.get("challenge")
+            if challenge:
+                logger.info(f"Slack URL verification challenge received: {challenge}")
+                return {"challenge": challenge}
+            else:
+                raise HTTPException(status_code=400, detail="Missing challenge parameter")
+        
+        # Verify Slack signature for all other requests
+        verify_slack_signature(request, body)
+        
+        # Handle app mentions
+        if "event" in payload:
+            event = payload["event"]
+            if event.get("type") == "app_mention":
+                await handle_app_mention(event)
+        
+        return {"status": "ok"}
+        
+    except Exception as e:
+        logger.error(f"Error handling Slack event: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/commands")
 async def slack_commands(request: Request):
     """Handle Slack slash commands"""
-    body = await request.body()
-    verify_slack_signature(request, body)
-    
-    # Parse form data
-    form_data = {}
-    for item in body.decode().split('&'):
-        key, value = item.split('=', 1)
-        form_data[key] = value.replace('+', ' ')
-    
-    command = form_data.get('command')
-    text = form_data.get('text', '')
-    channel_id = form_data.get('channel_id')
-    
-    response_text = await process_command(command, text)
-    
-    return {
-        "response_type": "in_channel",
-        "text": response_text
-    }
+    try:
+        body = await request.body()
+        verify_slack_signature(request, body)
+        
+        # Parse form data from Slack
+        form_data = {}
+        for item in body.decode().split('&'):
+            if '=' in item:
+                key, value = item.split('=', 1)
+                form_data[key] = value.replace('+', ' ')
+        
+        command = form_data.get('command', '').strip()
+        text = form_data.get('text', '').strip()
+        channel_id = form_data.get('channel_id')
+        user_id = form_data.get('user_id')
+        
+        # Process the command
+        response_text = await process_command(command, text, user_id, channel_id)
+        
+        return {
+            "response_type": "in_channel",
+            "text": response_text
+        }
+        
+    except Exception as e:
+        logger.error(f"Error handling Slack command: {e}")
+        return {
+            "response_type": "ephemeral",
+            "text": f"❌ Error processing command: {str(e)}"
+        }
 
-async def handle_mention(event):
-    """Process app mentions"""
-    text = event.get("text", "").lower()
-    channel = event.get("channel")
-    
-    response = await process_command_text(text)
-    await client.chat_postMessage(channel=channel, text=response)
+async def handle_app_mention(event):
+    """Handle @bot mentions"""
+    try:
+        text = event.get("text", "").lower()
+        channel = event.get("channel")
+        user = event.get("user")
+        
+        # Remove bot mention from text
+        text = " ".join([word for word in text.split() if not word.startswith("<@")])
+        
+        response = await process_command_text(text, user, channel)
+        
+        await client.chat_postMessage(
+            channel=channel,
+            text=response
+        )
+        
+    except Exception as e:
+        logger.error(f"Error handling app mention: {e}")
 
-async def process_command(command: str, text: str) -> str:
+async def process_command(command: str, text: str, user_id: str, channel_id: str) -> str:
     """Process slash commands"""
-    return await process_command_text(f"{command} {text}")
+    return await process_command_text(f"{command} {text}", user_id, channel_id)
 
-async def process_command_text(text: str) -> str:
+async def process_command_text(text: str, user_id: str, channel_id: str) -> str:
     """Process command text and return response"""
     text = text.lower().strip()
     
     try:
         if "status" in text or "health" in text:
-            stats = get_system_stats()
-            return f"🖥️ **System Status:**\n" \
-                   f"• CPU: {stats['cpu_percent']:.1f}%\n" \
-                   f"• Memory: {stats['memory_percent']:.1f}%\n" \
-                   f"• Disk: {stats['disk_percent']:.1f}%\n" \
-                   f"• Uptime: {stats['uptime']}"
-        
-        elif "deploy" in text:
-            # Extract app name from command
-            parts = text.split()
-            app_name = parts[1] if len(parts) > 1 else "nginx"
-            
-            result = await deploy_application(app_name)
-            if result["success"]:
-                return f"🚀 **Deployment Success:** {result['message']}"
-            else:
-                return f"❌ **Deployment Failed:** {result['message']}"
-        
-        elif "restart" in text:
-            services = ["nginx", "redis", "postgresql"]
-            results = restart_failed_services(services)
-            
-            response = "🔄 **Service Restart Results:**\n"
-            for result in results:
-                emoji = "✅" if result["success"] else "❌"
-                response += f"{emoji} {result['service']}: {result['message']}\n"
-            return response
-        
-        elif "clean" in text:
-            result = clean_disk_space()
-            if result["action"] == "clean":
-                return f"🧹 **Disk Cleanup:** {result['message']}"
-            else:
-                return f"💾 **Disk Status:** {result['message']}"
+            stats = await get_system_stats()
+            return await format_system_stats_for_slack(stats)
         
         elif "help" in text:
             return """🤖 **DevOps ChatBot Commands:**
             
 • `status` or `health` - Get system status
 • `deploy <app_name>` - Deploy/restart application  
-• `restart` - Restart failed services
-• `clean` - Clean disk space if needed
+• `restart` or `heal` - Run healing operations
+• `clean` - Clean disk space
 • `help` - Show this help message
 
 **Examples:**
-• `@botname status`
+• `@DevOps ChatBot status`
 • `/devops deploy nginx`
-• `@botname restart services`
+• `@DevOps ChatBot heal`
 """
+        
+        elif "deploy" in text:
+            # Extract app name from command
+            parts = text.split()
+            app_name = "nginx"  # default
+            for i, part in enumerate(parts):
+                if part == "deploy" and i + 1 < len(parts):
+                    app_name = parts[i + 1]
+                    break
+            
+            result = await deploy_application(app_name, user_id, channel_id)
+            return await format_deployment_result_for_slack(result)
+        
+        elif "heal" in text or "restart" in text:
+            result = await run_healing_tasks(user_id, channel_id)
+            return await format_healing_results_for_slack(result)
+        
+        elif "clean" in text:
+            result = await run_healing_tasks(user_id, channel_id, ["clean_disk_space"])
+            return await format_healing_results_for_slack(result)
         
         else:
             return "🤔 I don't understand that command. Type `help` to see available commands."
